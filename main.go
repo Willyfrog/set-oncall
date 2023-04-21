@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"flag"
@@ -11,22 +12,29 @@ import (
 	"time"
 	"github.com/opsgenie/opsgenie-go-sdk-v2/client"
 	"github.com/opsgenie/opsgenie-go-sdk-v2/schedule"
-	"github.com/opsgenie/opsgenie-go-sdk-v2/user"
+	log "github.com/sirupsen/logrus"
 )
 
-type OnCallResponse struct {
-	Data struct {
-		OnCallParticipants []string `json:"onCallRecipients"`
-	} `json:"data"`
-}
-
+// ScheduleMap is the format within config to write
+// "opsgenie schedule name": "display name"
 type ScheduleMap map[string]string
 
-type Results map[string][]string
-
+// Config type defilnes the json format for the configuration file
+//   {
+//     "schedules": {
+//       "opsgenie": "The OpsGenie Schedule",
+//     }
+//   }
 type Config struct {
 	Schedules ScheduleMap `json:"schedules"`
 }
+
+// Results schedule:[list of users on rotation]
+type Results map[string][]string
+
+// UserSet opsgenieEmail: MMusername
+type UserSet map[string]string
+
 
 func readConfigSchedules(filepath string) (ScheduleMap, error) {
 	// Read the contents of the config file into a byte slice
@@ -44,47 +52,60 @@ func readConfigSchedules(filepath string) (ScheduleMap, error) {
 	return config.Schedules, nil
 }
 
-func nextMonday() {
+
+const earlyShiftFormat = "%sT09:00:00+00:00"
+const lateShiftFormat = "%sT17:00:00+00:00"
+
+func getShiftDate(thisWeek bool, early bool) *time.Time {
+	day := time.Now()
+	if !thisWeek {
+		day = day.AddDate(0, 0, 7-int(day.Weekday())+1)
+	}
+
+	hours := 9
+	if !early {
+		hours = 17
+	}
+	shift, _ := time.ParseDuration(fmt.Sprintf("%vh", hours-day.Hour()))
+	day = day.Add(shift)
+	return &day
 }
 
-func getScheduleParticipants(scheduleName string, thisWeek bool, apiKey string) (*OnCallResponse, error) {
-	var url string
-	if thisWeek {
-		url = fmt.Sprintf("https://api.opsgenie.com/v2/schedules/%s/on-calls?scheduleIdentifierType=name&flat=true", scheduleName)
-	} else {
-		now := time.Now()
-		startOfWeek := now.AddDate(0, 0, -int(now.Weekday())+1)
-		endOfWeek := startOfWeek.AddDate(0, 0, 7)
-		url = fmt.Sprintf("https://api.opsgenie.com/v2/schedules/%s/on-calls?startDate=%s&endDate=%s&scheduleIdentifierType=name&flat=true", scheduleName, startOfWeek.Format("2006-01-02"), endOfWeek.Format("2006-01-02"))
+func getScheduleParticipants(scheduleName string, thisWeek bool, client *schedule.Client) (UserSet, error) {
+	
+	flat := true
+	earlyReq := &schedule.GetOnCallsRequest{
+		Flat: &flat,
+		Date: getShiftDate(thisWeek, true),
+		ScheduleIdentifierType: schedule.Name,
+		ScheduleIdentifier: scheduleName,
 	}
-	fmt.Println("Accessing url ", url)
-	req, err := http.NewRequest("GET", url, nil)
-	if err != nil {
-		fmt.Println("Error creating request:", err)
-		return nil, err
-	}
-	req.Header.Set("Authorization", "GenieKey "+apiKey)
-	client := &http.Client{}
-	resp, err := client.Do(req)
-	if err != nil {
-		fmt.Println("Error making request:", err)
-		return nil, err
-	}
-	defer resp.Body.Close()
-	fmt.Println("Opsgenie status response:", resp.Status)
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		fmt.Println("Error reading response:", err)
-		return nil, err
+	lateReq := &schedule.GetOnCallsRequest{
+		Flat: &flat,
+		Date: getShiftDate(thisWeek, false),
+		ScheduleIdentifierType: schedule.Name,
+		ScheduleIdentifier: scheduleName,
 	}
 
-	var onCallResponse OnCallResponse
-	err = json.Unmarshal(body, &onCallResponse)
+	earlyOnCall, err := client.GetOnCalls(context.TODO(), earlyReq)
 	if err != nil {
-		fmt.Println("Error decoding response:", err)
+		log.Fatal("Error trying to get the early shift")
 		return nil, err
 	}
-	return &onCallResponse, nil
+	lateOnCall, err := client.GetOnCalls(context.TODO(), lateReq)
+	if err != nil {
+		log.Fatal("Error trying to get the late shift")
+		return nil, err
+	}
+	results := UserSet{} // Using a map to prevent duplicates
+	for _, user := range(earlyOnCall.OnCallRecipients) {
+		results[user] = "" //will add MM username here
+	}
+	for _, user := range(lateOnCall.OnCallRecipients) {
+		results[user] = "" //will add MM username here
+	}
+
+	return results, nil
 }
 
 func main() {
@@ -95,7 +116,7 @@ func main() {
 	}
 	webhookURL := os.Getenv("MATTERMOST_WEBHOOK_URL")
 	if webhookURL == "" {
-		fmt.Println("MATTERMOST_WEBHOOK_URL environment variable not set.")
+		log.Fatal("MATTERMOST_WEBHOOK_URL environment variable not set.")
 		return
 	}
 
@@ -108,43 +129,50 @@ func main() {
 	if err != nil {
 		fmt.Println("Error reading the schedules", err)
 	}
+
+	scheduleClient, err := schedule.NewClient(&client.Config{
+		ApiKey: apiKey,
+	})
+	if err != nil {
+		log.Fatal("Not able to create an OpsGenie client")
+	}
+	
 	var results = make(Results)
 	for scheduleName, scheduleDisplay := range schedules {
-		onCallResponse, err := getScheduleParticipants(scheduleName, thisWeek, apiKey)
+		onCallResponse, err := getScheduleParticipants(scheduleName, thisWeek, scheduleClient)
 		if err != nil {
 			fmt.Println("Error getting the schedule ", scheduleDisplay, err)
 		}
 		results[scheduleDisplay] = []string{}
-		for _, onCall := range onCallResponse.Data.OnCallParticipants {
+		for onCallmail := range onCallResponse {
 			// todo: translate into MM usernames
-			results[scheduleDisplay] = append(results[scheduleDisplay], onCall)
+			results[scheduleDisplay] = append(results[scheduleDisplay], onCallmail)
 		}
 	}
-	
+
+	var message string
+	if thisWeek {
+		message = "The following people are currently on call this week:\n"
+	} else {
+		message = "Heads up for next week on call rotation:\n"
+	}
 	for scheduleName, usernames := range results {
-		var messageTemplate string
-		if thisWeek {
-			messageTemplate = "The following users are currently on call for schedule %s: %s"
-		} else {
-			messageTemplate = "The following users will be on call for schedule %s next week: %s"
-		}
-		message := fmt.Sprintf(messageTemplate, scheduleName, strings.Join(usernames, ", "))
-		
-		payload := map[string]string{
-			"text": message,
-		}
-		payloadBytes, err := json.Marshal(payload)
-		if err != nil {
-			fmt.Println("Error encoding payload:", err)
-			return
-		}
-		resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(payloadBytes)))
-		if err != nil {
-			fmt.Println("Error sending webhook:", err)
-			return
-		}
-		defer resp.Body.Close()
+		message = message + fmt.Sprintf(" - %s: %s\n", scheduleName, strings.Join(usernames, ", "))
 	}
+	payload := map[string]string{
+		"text": message,
+	}
+	payloadBytes, err := json.Marshal(payload)
+	if err != nil {
+		fmt.Println("Error encoding payload:", err)
+		return
+	}
+	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(string(payloadBytes)))
+	if err != nil {
+		fmt.Println("Error sending webhook:", err)
+		return
+	}
+	defer resp.Body.Close()
 
 	fmt.Println("Successfully sent on-call users to Mattermost channel.")
 }
