@@ -124,15 +124,18 @@ func getScheduleParticipants(scheduleName string, thisWeek bool, client *schedul
 	return results, nil
 }
 
-func getUserFromMail(email string, client model.Client4) (string, error) {
+func getUserFromMail(email string, client *model.Client4) (string, error) {
+	log.Print("Converting %s into a mm user: ", email)
 	user, _, err := client.GetUserByEmail(email, "")
 	if err != nil {
+		log.Error(err)
 		return "", err
 	}
-	return user.Username, err
+	log.Print("MM user is: @", user.Username)
+	return fmt.Sprintf("@%s", user.Username), err
 }
 
-func getMMUsers(users []string, client model.Client4) ([]string, error) {
+func getMMUsers(users []string, client *model.Client4) ([]string, error) {
 	var mmusers []string
 	numErrors := 0
 	for _, email := range(users) {
@@ -146,7 +149,7 @@ func getMMUsers(users []string, client model.Client4) ([]string, error) {
 	var finalError error
 	finalError = nil
 	if numErrors == len(users) {
-		finalError = fmt.Errorf("Unable to connect to Mattermost instance %s to get the usernames", client.APIURL)
+		finalError = fmt.Errorf("Too many errors connecting to Mattermost instance %s to get the usernames", client.APIURL)
 	}
 	return mmusers, finalError
 }
@@ -177,6 +180,10 @@ func main() {
 	if err != nil {
 		fmt.Println("Error reading config.json", err)
 	}
+	// check config
+	if config.SiteURL == "" {
+		log.Fatal("Site Url not set in the config")
+	}
 
 	scheduleClient, err := schedule.NewClient(&client.Config{
 		ApiKey: apiKey,
@@ -195,9 +202,13 @@ func main() {
 		}
 		results[scheduleDisplay] = []string{}
 		for onCallmail := range onCallResponse {
-			// todo: translate into MM usernames
 			results[scheduleDisplay] = append(results[scheduleDisplay], onCallmail)
 		}
+		mmUsers, err := getMMUsers(results[scheduleDisplay], mmClient)
+		if err != nil {
+			log.Fatal(err)
+		}
+		results[scheduleDisplay] = mmUsers
 	}
 
 	var title string
