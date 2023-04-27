@@ -13,20 +13,35 @@ import (
 	"github.com/opsgenie/opsgenie-go-sdk-v2/client"
 	"github.com/opsgenie/opsgenie-go-sdk-v2/schedule"
 	log "github.com/sirupsen/logrus"
+	model "github.com/mattermost/mattermost-server/v6/model"
 )
 
 // ScheduleMap is the format within config to write
 // "opsgenie schedule name": "display name"
 type ScheduleMap map[string]string
 
+// TitleLink consist on a list of two title links to put on top of the card, the first one is for the current week and the second one is for the incoming week
+type TitleLink []string
+
+// Titles consist on a list of two titles texts to put on top of the card, the first one is for the current week and the second one is for the incoming week
+type Titles []string
+
 // Config type defilnes the json format for the configuration file
 //   {
 //     "schedules": {
 //       "opsgenie": "The OpsGenie Schedule",
 //     }
+//     "title": ["this week's title", "next week one"],
+//     "titleLink": ["link on title for this week"],
+//     "username": "bot",
+//     "iconurl": "some image to display"
 //   }
 type Config struct {
 	Schedules ScheduleMap `json:"schedules"`
+	Titles Titles `json:"title"`
+	TitleLinks TitleLink `json:"titleLink"`
+	Username string `json:"username"`
+	IconURL string `json:"iconurl"`
 }
 
 // Results schedule:[list of users on rotation]
@@ -36,7 +51,7 @@ type Results map[string][]string
 type UserSet map[string]string
 
 
-func readConfigSchedules(filepath string) (ScheduleMap, error) {
+func readConfig(filepath string) (*Config, error) {
 	// Read the contents of the config file into a byte slice
 	fileContents, err := ioutil.ReadFile(filepath)
 	if err != nil {
@@ -49,7 +64,7 @@ func readConfigSchedules(filepath string) (ScheduleMap, error) {
 		return nil, err
 	}
 
-	return config.Schedules, nil
+	return &config, nil
 }
 
 
@@ -119,15 +134,20 @@ func main() {
 		log.Fatal("MATTERMOST_WEBHOOK_URL environment variable not set.")
 		return
 	}
+	mattermostKey := os.Getenv("MATTERMOST_API_KEY")
+	if apiKey == "" {
+		fmt.Println("MATTERMOST_API_KEY environment variable not set.")
+		return
+	}
 
 	// Define command line flags
 	nextWeek := flag.Bool("next-week", false, "Query users who will be on-call next week, set to false (default) for this week")
 	flag.Parse()
 	thisWeek := !*nextWeek
 
-	schedules, err := readConfigSchedules("./config.json")
+	config, err := readConfig("./config.json")
 	if err != nil {
-		fmt.Println("Error reading the schedules", err)
+		fmt.Println("Error reading config.json", err)
 	}
 
 	scheduleClient, err := schedule.NewClient(&client.Config{
@@ -138,7 +158,7 @@ func main() {
 	}
 	
 	var results = make(Results)
-	for scheduleName, scheduleDisplay := range schedules {
+	for scheduleName, scheduleDisplay := range config.Schedules {
 		onCallResponse, err := getScheduleParticipants(scheduleName, thisWeek, scheduleClient)
 		if err != nil {
 			fmt.Println("Error getting the schedule ", scheduleDisplay, err)
@@ -150,18 +170,49 @@ func main() {
 		}
 	}
 
-	var message string
+	var title string
+	var titleLink string
 	if thisWeek {
-		message = "The following people are currently on call this week:\n"
+		if len(config.Titles) >= 1 {
+			title = config.Titles[0]
+		} else {
+			title = ":rotating_light: Who is on Call this week :rotating_light:"
+		}
+		if len(config.TitleLinks) >= 1 {	
+			titleLink = config.TitleLinks[0]
+		} else {
+			titleLink = "https://www.mattermost.com"
+		}
 	} else {
-		message = "Heads up for next week on call rotation:\n"
+		if len(config.Titles) > 1 {
+			title = config.Titles[1]
+		} else {
+			title = "Heads up for next week on call rotation:"
+		}
+		if len(config.TitleLinks) > 1 {	
+			titleLink = config.TitleLinks[1]
+		} else {
+			titleLink = "https://www.mattermost.com"
+		}
 	}
+	fields := []*model.SlackAttachmentField{}
 	for scheduleName, usernames := range results {
-		message = message + fmt.Sprintf(" - %s: %s\n", scheduleName, strings.Join(usernames, ", "))
+		fields = append(fields, &model.SlackAttachmentField{Title: scheduleName, Value: strings.Join(usernames, ", "), Short: true})
 	}
-	payload := map[string]string{
-		"text": message,
+
+	attachment := &model.SlackAttachment{
+		Color:     "#ff0000",
+		Fields: fields,
 	}
+
+	
+	payload := model.CommandResponse{
+		Username:    "SET Team little helper",
+		IconURL:     "https://upload.wikimedia.org/wikipedia/commons/0/01/Creative-Tail-People-superman.svg",
+		Text:        fmt.Sprintf("### [%s](%s)", title, titleLink),
+		Attachments: []*model.SlackAttachment{attachment},
+	}
+	
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
 		fmt.Println("Error encoding payload:", err)
