@@ -42,6 +42,7 @@ type Config struct {
 	TitleLinks TitleLink `json:"titleLink"`
 	Username string `json:"username"`
 	IconURL string `json:"iconurl"`
+	SiteURL string `json:"siteurl"`
 }
 
 // Results schedule:[list of users on rotation]
@@ -123,6 +124,33 @@ func getScheduleParticipants(scheduleName string, thisWeek bool, client *schedul
 	return results, nil
 }
 
+func getUserFromMail(email string, client model.Client4) (string, error) {
+	user, _, err := client.GetUserByEmail(email, "")
+	if err != nil {
+		return "", err
+	}
+	return user.Username, err
+}
+
+func getMMUsers(users []string, client model.Client4) ([]string, error) {
+	var mmusers []string
+	numErrors := 0
+	for _, email := range(users) {
+		username, err := getUserFromMail(email, client)
+		if err != nil {
+			username = email
+			numErrors++
+		}
+		mmusers = append(mmusers, username)
+	}
+	var finalError error
+	finalError = nil
+	if numErrors == len(users) {
+		finalError = fmt.Errorf("Unable to connect to Mattermost instance %s to get the usernames", client.APIURL)
+	}
+	return mmusers, finalError
+}
+
 func main() {
 	apiKey := os.Getenv("OPSGENIE_API_KEY")
 	if apiKey == "" {
@@ -156,6 +184,8 @@ func main() {
 	if err != nil {
 		log.Fatal("Not able to create an OpsGenie client")
 	}
+	mmClient := model.NewAPIv4Client(config.SiteURL)
+	mmClient.SetToken(mattermostKey)
 	
 	var results = make(Results)
 	for scheduleName, scheduleDisplay := range config.Schedules {
