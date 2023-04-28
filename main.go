@@ -26,6 +26,8 @@ type TitleLink []string
 // Titles consist on a list of two titles texts to put on top of the card, the first one is for the current week and the second one is for the incoming week
 type Titles []string
 
+type UserMapping map[string]string
+
 // Config type defilnes the json format for the configuration file
 //   {
 //     "schedules": {
@@ -43,6 +45,7 @@ type Config struct {
 	Username string `json:"username"`
 	IconURL string `json:"iconurl"`
 	SiteURL string `json:"siteurl"`
+	UserMapping UserMapping `json:"usermapping"`
 }
 
 // Results schedule:[list of users on rotation]
@@ -124,34 +127,63 @@ func getScheduleParticipants(scheduleName string, thisWeek bool, client *schedul
 	return results, nil
 }
 
-func getUserFromMail(email string, client *model.Client4) (string, error) {
-	log.Print("Converting %s into a mm user: ", email)
-	user, _, err := client.GetUserByEmail(email, "")
-	if err != nil {
-		log.Error(err)
-		return "", err
-	}
-	log.Print("MM user is: @", user.Username)
-	return fmt.Sprintf("@%s", user.Username), err
+
+func extractUsername(emails []string, usernameMap map[string]string) []string {
+    usernames := []string{}
+
+    for _, email := range emails {
+        // Split email by "@" symbol
+        parts := strings.Split(email, "@")
+
+        // Split username by "+" sign, if present
+        usernameParts := strings.Split(parts[0], "+")
+
+        // Get original username
+        originalUsername := usernameParts[0]
+
+        // Check if original username is in usernameMap, and replace it if so
+        newUsername, ok := usernameMap[originalUsername]
+        if ok {
+            originalUsername = newUsername
+        }
+
+        // Add the username to usernames list
+	    usernames = append(usernames, originalUsername)
+    }
+
+    return usernames
 }
 
-func getMMUsers(users []string, client *model.Client4) ([]string, error) {
-	var mmusers []string
-	numErrors := 0
-	for _, email := range(users) {
-		username, err := getUserFromMail(email, client)
+func makeAtMentions(usernames []string) []string {
+	mentions := []string{}
+	for _, user := range usernames {
+		mentions = append(mentions, fmt.Sprintf("@%s", user))
+	}
+	return mentions
+}
+
+func getChannel(client *model.Client4, webhook string) (string, error) {
+	parts := strings.Split(webhook, "/hooks/")
+	hookID := parts[len(parts)-1]
+	hook, _,  err := client.GetIncomingWebhook(hookID, "")
+	if err != nil {
+		return "", err
+	}
+	return hook.ChannelId, err
+}
+
+func addToChannel(client *model.Client4, users []string, channel string) {
+	for _, username := range users {
+		user, _, err := client.GetUserByUsername(username, "")
 		if err != nil {
-			username = email
-			numErrors++
+			log.Errorf("Couldn't find user %s id: %s", username, err)
+			return
 		}
-		mmusers = append(mmusers, username)
+		_, _, err = client.AddChannelMember(channel, user.Id)
+		if err != nil {
+			log.Errorf("Error adding %s to the channel: %s", err)
+		}
 	}
-	var finalError error
-	finalError = nil
-	if numErrors == len(users) {
-		finalError = fmt.Errorf("Too many errors connecting to Mattermost instance %s to get the usernames", client.APIURL)
-	}
-	return mmusers, finalError
 }
 
 func main() {
@@ -193,6 +225,11 @@ func main() {
 	}
 	mmClient := model.NewAPIv4Client(config.SiteURL)
 	mmClient.SetToken(mattermostKey)
+
+	channelID, err := getChannel(mmClient, webhookURL)
+	if err != nil {
+		log.Fatal("Couldn't get the channel ID", err)
+	}
 	
 	var results = make(Results)
 	for scheduleName, scheduleDisplay := range config.Schedules {
@@ -204,11 +241,7 @@ func main() {
 		for onCallmail := range onCallResponse {
 			results[scheduleDisplay] = append(results[scheduleDisplay], onCallmail)
 		}
-		mmUsers, err := getMMUsers(results[scheduleDisplay], mmClient)
-		if err != nil {
-			log.Fatal(err)
-		}
-		results[scheduleDisplay] = mmUsers
+		results[scheduleDisplay] = extractUsername(results[scheduleDisplay], config.UserMapping)
 	}
 
 	var title string
@@ -238,7 +271,8 @@ func main() {
 	}
 	fields := []*model.SlackAttachmentField{}
 	for scheduleName, usernames := range results {
-		fields = append(fields, &model.SlackAttachmentField{Title: scheduleName, Value: strings.Join(usernames, ", "), Short: true})
+		addToChannel(mmClient, usernames, channelID)
+		fields = append(fields, &model.SlackAttachmentField{Title: scheduleName, Value: strings.Join(makeAtMentions(usernames), ", "), Short: true})
 	}
 
 	attachment := &model.SlackAttachment{
